@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Elif Yarışı</title>
+<title>Elif Yarışı - Aşama B + Jiroskop</title>
 <style>
   * {
     margin: 0;
@@ -36,17 +36,27 @@
   'use strict';
 
   // ============================================================
-  //  AYAR SABİTLERİ  (revizyon için en üstte topladım)
+  //  AYAR SABİTLERİ
   // ============================================================
   const CONFIG = {
     LANE_COUNT: 3,
-    CAR_LERP: 0.18,            // şerit geçiş yumuşaklığı (0-1)
-    SPHERE_SPEED: 240,         // küre düşme hızı (px/s)
-    SPHERE_SPAWN_MS: 1500,     // küreler arası süre (ms)
-    SCROLL_SPEED: 340,         // yol akış hızı (px/s)
-    ENERGY_PER_PICKUP: 0.12,   // her toplamada bar kaç birim dolar
-    CAR_BOTTOM_OFFSET: 120,    // arabanın alttan yüksekliği (px)
-    PICKUP_TOLERANCE_Y: 55,    // çarpışma için dikey tolerans (px)
+    CAR_LERP: 0.18,
+    SPHERE_SPEED: 240,
+    SPHERE_SPAWN_MS: 1400,
+    SCROLL_SPEED: 340,
+    ENERGY_PER_PICKUP: 0.12,
+    CAR_BOTTOM_OFFSET: 120,
+    PICKUP_TOLERANCE_Y: 55,
+
+    // Aşama B
+    ELIF_PROBABILITY: 0.55,
+    HEADLIGHT_FLASH_MS: 450,
+    AUDIO_MASTER_VOLUME: 0.55,
+
+    // Jiroskop (yeni)
+    TILT_THRESHOLD: 15,            // derece: bu açıdan sonra yan şeride geç
+    TILT_HYSTERESIS: 5,            // derece: titremeyi engelleyen tampon
+    TILT_CALIBRATION_SAMPLES: 12,  // ilk N örneğin ortalaması = nötr açı
   };
 
   const PALETTE = {
@@ -72,10 +82,14 @@
     energyFill2: '#FF6FA4',
     energyFill3: '#7BE5C2',
     droplet: '#FF6FA4',
+    vavPuff1: '#C5C5C5',
+    vavPuff2: '#9A9A9A',
+    vavPuff3: '#B0B0B0',
+    headlightGlow: '#FFFAE0',
   };
 
   // ============================================================
-  //  CANVAS KURULUMU  (DPI farkındalıklı)
+  //  CANVAS KURULUMU
   // ============================================================
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
@@ -93,6 +107,207 @@
   }
   window.addEventListener('resize', resize);
   resize();
+
+  // ============================================================
+  //  WEB AUDIO API
+  // ============================================================
+  let audioCtx = null;
+  let masterGain = null;
+
+  function initAudio() {
+    if (audioCtx) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      audioCtx = new Ctx();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = CONFIG.AUDIO_MASTER_VOLUME;
+      masterGain.connect(audioCtx.destination);
+    } catch (e) {
+      console.warn('Web Audio API kullanılamıyor:', e);
+    }
+  }
+  function resumeAudio() {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+
+  function playDing() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const freqs = [1318.5, 1975.5];
+    freqs.forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = i === 0 ? 'sine' : 'triangle';
+      osc.frequency.setValueAtTime(freq, now);
+      const peak = i === 0 ? 0.22 : 0.10;
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(peak, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.42);
+      osc.connect(gain).connect(masterGain);
+      osc.start(now);
+      osc.stop(now + 0.48);
+    });
+  }
+
+  function playJingle() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const notes = [523.25, 659.25, 783.99, 1046.50];
+    notes.forEach((freq, i) => {
+      const start = now + i * 0.13;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, start);
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.22, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.32);
+      osc.connect(gain).connect(masterGain);
+      osc.start(start);
+      osc.stop(start + 0.36);
+    });
+    const sparkleStart = now + notes.length * 0.13;
+    [2093, 2637, 3136].forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, sparkleStart + i * 0.04);
+      gain.gain.setValueAtTime(0, sparkleStart + i * 0.04);
+      gain.gain.linearRampToValueAtTime(0.06, sparkleStart + i * 0.04 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0005, sparkleStart + i * 0.04 + 0.25);
+      osc.connect(gain).connect(masterGain);
+      osc.start(sparkleStart + i * 0.04);
+      osc.stop(sparkleStart + i * 0.04 + 0.28);
+    });
+  }
+
+  function playSoftPuff() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const bufferSize = Math.floor(audioCtx.sampleRate * 0.09);
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * 0.5;
+    }
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = buffer;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(420, now);
+    filter.Q.value = 0.6;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.07, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0005, now + 0.09);
+    noise.connect(filter).connect(gain).connect(masterGain);
+    noise.start(now);
+    noise.stop(now + 0.11);
+  }
+
+  // ============================================================
+  //  JİROSKOP / TILT KONTROL
+  // ============================================================
+  const tilt = {
+    permissionAsked: false,  // ilk dokunuşta tek seferlik tetiklemek için
+    listenerAttached: false, // listener'ı çoğul kez bağlamamak için
+    hasData: false,          // ilk geçerli event geldi mi
+    calibrated: false,       // nötr açı hesaplandı mı
+    calibrationSum: 0,
+    calibrationCount: 0,
+    neutralAngle: 0,         // çocuğun ilk tutuş açısı
+    gamma: 0,                // ham sensor verileri
+    beta: 0,
+    lastCommand: 1,          // tap ile senkron tutmak için
+  };
+
+  function getScreenAngle() {
+    if (screen.orientation && typeof screen.orientation.angle === 'number') {
+      return screen.orientation.angle;
+    }
+    if (typeof window.orientation === 'number') return window.orientation;
+    return 0;
+  }
+
+  // Cihaz tutuş yönüne göre yatay eğim açısını çıkar (derece)
+  // Pozitif = sağa eğik, Negatif = sola eğik
+  function getRawTilt() {
+    const a = getScreenAngle();
+    if (a === 90)               return -tilt.beta;   // sol-yana landscape
+    if (a === -90 || a === 270) return  tilt.beta;   // sağ-yana landscape
+    if (a === 180)              return -tilt.gamma;  // ters portrait
+    return tilt.gamma;                               // standart portrait
+  }
+  function getTiltAngle() {
+    return getRawTilt() - tilt.neutralAngle;
+  }
+
+  function onOrientation(e) {
+    if (e.gamma === null || e.beta === null) return;
+    if (typeof e.gamma !== 'number' || typeof e.beta !== 'number') return;
+
+    tilt.gamma = e.gamma;
+    tilt.beta  = e.beta;
+    tilt.hasData = true;
+
+    // İlk N örneği toplayıp nötr açıyı belirle (otomatik kalibrasyon)
+    if (!tilt.calibrated) {
+      tilt.calibrationSum += getRawTilt();
+      tilt.calibrationCount++;
+      if (tilt.calibrationCount >= CONFIG.TILT_CALIBRATION_SAMPLES) {
+        tilt.neutralAngle = tilt.calibrationSum / tilt.calibrationCount;
+        tilt.calibrated = true;
+        console.log('Jiroskop kalibre edildi. Nötr açı:', tilt.neutralAngle.toFixed(1) + '°');
+      }
+    }
+  }
+
+  function attachOrientationListener() {
+    if (tilt.listenerAttached) return;
+    tilt.listenerAttached = true;
+    window.addEventListener('deviceorientation', onOrientation);
+  }
+
+  // iOS 13+ izin akışı; diğer cihazlarda doğrudan bağla
+  function setupGyro() {
+    if (!('DeviceOrientationEvent' in window)) return;
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // iOS — yalnızca user gesture içinden çağrılabilir
+      DeviceOrientationEvent.requestPermission()
+        .then(response => {
+          if (response === 'granted') attachOrientationListener();
+        })
+        .catch(() => { /* sessiz fallback */ });
+    } else {
+      // Android, masaüstü, eski iOS — izin gerekmez
+      attachOrientationListener();
+    }
+  }
+
+  // Sayfa yüklendiğinde izin gerekmeyen tarayıcılarda hemen bağla
+  if ('DeviceOrientationEvent' in window &&
+      typeof DeviceOrientationEvent.requestPermission !== 'function') {
+    attachOrientationListener();
+  }
+
+  function applyTiltControl() {
+    if (!tilt.calibrated) return;     // henüz nötr açı hazır değil
+    if (!state.started) return;       // oyun başlamadıysa karışma
+
+    const angle = getTiltAngle();
+    const t = CONFIG.TILT_THRESHOLD;
+    const back = t - CONFIG.TILT_HYSTERESIS;
+
+    let command;
+    if (angle >  t)              command = 2;                  // sağa eğik → sağ şerit
+    else if (angle < -t)         command = 0;                  // sola eğik → sol şerit
+    else if (Math.abs(angle) < back) command = 1;              // dik → orta şerit
+    else                         command = tilt.lastCommand;   // histerezis bandı
+
+    state.carTargetLane = command;
+    tilt.lastCommand = command;
+  }
 
   // ============================================================
   //  YARDIMCI FONKSİYONLAR
@@ -134,6 +349,7 @@
     particles: [],
     energy: 0,
     energyPulse: 0,
+    headlightFlash: 0,
     roadOffset: 0,
     lastSpawn: 0,
     timeMs: 0,
@@ -142,16 +358,27 @@
   state.carX = laneX(state.carLane);
 
   // ============================================================
-  //  GİRDİ  (her tıklama/dokunma → en yakın şerit)
+  //  GİRDİ
   // ============================================================
   function handleInput(clientX) {
+    initAudio();
+    resumeAudio();
+
+    // İlk dokunuşta jiroskop izin akışını sessizce başlat
+    if (!tilt.permissionAsked) {
+      tilt.permissionAsked = true;
+      setupGyro();
+    }
+
     const { left, width } = roadBounds();
     let lane = Math.floor(((clientX - left) / width) * CONFIG.LANE_COUNT);
     lane = Math.max(0, Math.min(CONFIG.LANE_COUNT - 1, lane));
     state.carTargetLane = lane;
+    tilt.lastCommand = lane; // tap ile tilt'i senkron tut
+
     if (!state.started) {
       state.started = true;
-      state.lastSpawn = state.timeMs - CONFIG.SPHERE_SPAWN_MS + 300; // hızlı ilk küre
+      state.lastSpawn = state.timeMs - CONFIG.SPHERE_SPAWN_MS + 300;
     }
   }
   canvas.addEventListener('mousedown', (e) => handleInput(e.clientX));
@@ -165,6 +392,7 @@
   // ============================================================
   function spawnSphere() {
     const lane = Math.floor(Math.random() * CONFIG.LANE_COUNT);
+    const isElif = Math.random() < CONFIG.ELIF_PROBABILITY;
     state.spheres.push({
       lane,
       x: laneX(lane),
@@ -172,9 +400,11 @@
       radius: 44,
       wobble: Math.random() * Math.PI * 2,
       alive: true,
+      letter: isElif ? 'elif' : 'vav',
     });
   }
-  function spawnParticles(x, y) {
+
+  function spawnRewardParticles(x, y) {
     const colors = ['#FFD84D', '#FF6FA4', '#7BE5C2', '#FFFFFF', '#FFC65C', '#A78BFA'];
     for (let i = 0; i < 22; i++) {
       const angle = (Math.PI * 2 * i) / 22 + (Math.random() - 0.5) * 0.4;
@@ -202,6 +432,24 @@
     }
   }
 
+  function spawnPuffParticles(x, y) {
+    const colors = [PALETTE.vavPuff1, PALETTE.vavPuff2, PALETTE.vavPuff3];
+    for (let i = 0; i < 9; i++) {
+      const angle = (Math.PI * 2 * i) / 9 + (Math.random() - 0.5) * 0.5;
+      const speed = 50 + Math.random() * 70;
+      state.particles.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 25,
+        life: 0.55,
+        size: 5 + Math.random() * 3,
+        color: colors[(Math.random() * colors.length) | 0],
+        star: false,
+        puff: true,
+      });
+    }
+  }
+
   // ============================================================
   //  GÜNCELLEME
   // ============================================================
@@ -209,29 +457,27 @@
     state.timeMs += dt * 1000;
     state.carBob += dt * 4;
 
-    // Araba yumuşak şerit geçişi
+    // Jiroskop verisi varsa şerit hedefini güncelle (taps fallback'i bozmadan)
+    applyTiltControl();
+
     const targetX = laneX(state.carTargetLane);
     state.carX += (targetX - state.carX) * CONFIG.CAR_LERP;
     state.carLane = state.carTargetLane;
 
-    // Yolun sürekli akması (oyun başlamamış olsa bile küçük animasyon)
     const scroll = state.started ? CONFIG.SCROLL_SPEED : CONFIG.SCROLL_SPEED * 0.25;
     state.roadOffset = (state.roadOffset + scroll * dt) % 80;
 
     if (!state.started) return;
 
-    // Küre üretimi
     if (state.timeMs - state.lastSpawn > CONFIG.SPHERE_SPAWN_MS) {
       spawnSphere();
       state.lastSpawn = state.timeMs;
     }
 
-    // Küreleri güncelle + çarpışma
     const carY = H - CONFIG.CAR_BOTTOM_OFFSET;
     for (const s of state.spheres) {
       s.y += CONFIG.SPHERE_SPEED * dt;
       s.wobble += dt * 3;
-      // şerit konumu da hafif lerp ile takip etsin (kürelerin doğal akışı)
       s.x = laneX(s.lane);
       if (s.alive && s.lane === state.carLane) {
         if (Math.abs(s.y - carY) < CONFIG.PICKUP_TOLERANCE_Y) {
@@ -242,31 +488,39 @@
     }
     state.spheres = state.spheres.filter(s => s.alive && s.y < H + 80);
 
-    // Parçacıklar
     for (const p of state.particles) {
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-      p.vy += 620 * dt;
-      p.life -= dt * 1.3;
+      p.vy += (p.puff ? 180 : 620) * dt;
+      p.life -= dt * (p.puff ? 1.8 : 1.3);
     }
     state.particles = state.particles.filter(p => p.life > 0);
 
-    if (state.energyPulse > 0) state.energyPulse = Math.max(0, state.energyPulse - dt * 3);
-    if (state.celebrate   > 0) state.celebrate   = Math.max(0, state.celebrate   - dt * 0.9);
+    if (state.energyPulse    > 0) state.energyPulse    = Math.max(0, state.energyPulse    - dt * 3);
+    if (state.celebrate      > 0) state.celebrate      = Math.max(0, state.celebrate      - dt * 0.9);
+    if (state.headlightFlash > 0) state.headlightFlash = Math.max(0, state.headlightFlash - dt * (1000 / CONFIG.HEADLIGHT_FLASH_MS));
   }
 
   function onPickup(s) {
-    spawnParticles(s.x, s.y);
-    state.energyPulse = 1;
-    console.log("Ses çalındı: Aaaa ve Tin! efekti");
+    if (s.letter === 'elif') {
+      spawnRewardParticles(s.x, s.y);
+      state.energyPulse = 1;
+      state.headlightFlash = 1;
+      playDing();
+      console.log("Ses çalındı: Aaaa ve Tin! efekti");
 
-    state.energy += CONFIG.ENERGY_PER_PICKUP;
-    if (state.energy >= 1) {
-      state.energy = 1;
-      state.celebrate = 1;
-      // küçük kutlama, sonra barı sıfırla
-      setTimeout(() => { state.energy = 0; }, 1300);
-      console.log("Kontrol noktası! Bar doldu, yeni boya açıldı (placeholder).");
+      state.energy += CONFIG.ENERGY_PER_PICKUP;
+      if (state.energy >= 1) {
+        state.energy = 1;
+        state.celebrate = 1;
+        playJingle();
+        setTimeout(() => { state.energy = 0; }, 1300);
+        console.log("Kontrol noktası! Bar doldu, yeni boya açıldı (placeholder).");
+      }
+    } else {
+      spawnPuffParticles(s.x, s.y);
+      playSoftPuff();
+      console.log("Pıf efekti (Vav - çeldirici, ceza yok)");
     }
   }
 
@@ -280,7 +534,6 @@
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, W, H);
 
-    // Uzaktaki tepeler
     ctx.fillStyle = PALETTE.hills;
     ctx.beginPath();
     const hillY = H * 0.42;
@@ -293,37 +546,29 @@
     ctx.closePath();
     ctx.fill();
 
-    // Bulutlar (yavaşça hareket)
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     const cloudT = state.timeMs * 0.01;
     [[0.15, 0.18, 1.0], [0.55, 0.10, 0.8], [0.82, 0.22, 1.1]].forEach(([fx, fy, scale]) => {
       const cx = ((fx * W + cloudT) % (W + 200)) - 100;
       const cy = fy * H;
       ctx.beginPath();
-      ctx.arc(cx,        cy,        22 * scale, 0, Math.PI * 2);
-      ctx.arc(cx + 22*scale, cy - 8*scale, 26 * scale, 0, Math.PI * 2);
-      ctx.arc(cx + 45*scale, cy,        20 * scale, 0, Math.PI * 2);
+      ctx.arc(cx,            cy,            22 * scale, 0, Math.PI * 2);
+      ctx.arc(cx + 22*scale, cy - 8*scale,  26 * scale, 0, Math.PI * 2);
+      ctx.arc(cx + 45*scale, cy,            20 * scale, 0, Math.PI * 2);
       ctx.fill();
     });
   }
 
   function drawRoad() {
     const { left, width } = roadBounds();
-
-    // Çim/kenar
     ctx.fillStyle = PALETTE.roadShoulder;
     ctx.fillRect(left - 26, 0, width + 52, H);
-
-    // Yol
     ctx.fillStyle = PALETTE.road;
     ctx.fillRect(left, 0, width, H);
-
-    // Beyaz yol kenarları
     ctx.fillStyle = PALETTE.roadEdge;
     ctx.fillRect(left - 4, 0, 4, H);
     ctx.fillRect(left + width, 0, 4, H);
 
-    // Şerit çizgileri (akan kesik çizgiler)
     const laneWidth = width / CONFIG.LANE_COUNT;
     ctx.fillStyle = PALETTE.laneLine;
     for (let i = 1; i < CONFIG.LANE_COUNT; i++) {
@@ -339,7 +584,6 @@
     const x = s.x + wob;
     const y = s.y;
 
-    // Glow halkaları
     for (let i = 3; i >= 1; i--) {
       ctx.globalAlpha = 0.16 * (4 - i) / 3;
       ctx.fillStyle = PALETTE.sphereGlow;
@@ -349,24 +593,22 @@
     }
     ctx.globalAlpha = 1;
 
-    // Ana küre
     ctx.fillStyle = PALETTE.sphere;
     ctx.beginPath();
     ctx.arc(x, y, s.radius, 0, Math.PI * 2);
     ctx.fill();
 
-    // Parlama
     ctx.fillStyle = 'rgba(255,255,255,0.7)';
     ctx.beginPath();
     ctx.arc(x - s.radius * 0.38, y - s.radius * 0.38, s.radius * 0.26, 0, Math.PI * 2);
     ctx.fill();
 
-    // Elif harfi
+    const char = s.letter === 'elif' ? 'ا' : 'و';
     ctx.fillStyle = PALETTE.sphereText;
     ctx.font = `bold ${Math.floor(s.radius * 1.55)}px "Tahoma", "Arial", sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('ا', x, y + 4);
+    ctx.fillText(char, x, y + 4);
   }
 
   function drawCar() {
@@ -374,13 +616,11 @@
     const y = H - CONFIG.CAR_BOTTOM_OFFSET + Math.sin(state.carBob) * 2;
     const w = 78, h = 108;
 
-    // Gölge
     ctx.fillStyle = 'rgba(0,0,0,0.32)';
     ctx.beginPath();
     ctx.ellipse(x, y + h / 2 + 10, w / 2 + 4, 9, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Tekerlekler
     ctx.fillStyle = PALETTE.carWheel;
     const wheelPositions = [
       [-w/2 - 4, -h/2 + 22],
@@ -393,41 +633,53 @@
       ctx.fill();
     });
 
-    // Gövde
     ctx.fillStyle = PALETTE.carBody;
     roundRect(x - w/2, y - h/2, w, h, 16);
     ctx.fill();
 
-    // Tavan
     ctx.fillStyle = PALETTE.carRoof;
     roundRect(x - w/2 + 9, y - h/2 + 16, w - 18, 38, 11);
     ctx.fill();
 
-    // Pencere
     ctx.fillStyle = PALETTE.carWindow;
     roundRect(x - w/2 + 15, y - h/2 + 22, w - 30, 24, 7);
     ctx.fill();
-
-    // Pencere yansıması
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     roundRect(x - w/2 + 17, y - h/2 + 24, 14, 8, 4);
     ctx.fill();
 
-    // Farlar
-    ctx.fillStyle = PALETTE.carHeadlight;
+    const hLeftX  = x - w/2 + 14;
+    const hRightX = x + w/2 - 14;
+    const hY = y + h/2 - 14;
+
+    if (state.headlightFlash > 0) {
+      ctx.globalAlpha = state.headlightFlash * 0.55;
+      ctx.fillStyle = PALETTE.headlightGlow;
+      ctx.beginPath();
+      ctx.arc(hLeftX,  hY, 26, 0, Math.PI * 2);
+      ctx.arc(hRightX, hY, 26, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = state.headlightFlash * 0.85;
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.arc(hLeftX,  hY, 14, 0, Math.PI * 2);
+      ctx.arc(hRightX, hY, 14, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = state.headlightFlash > 0.4 ? '#FFFFFF' : PALETTE.carHeadlight;
     ctx.beginPath();
-    ctx.arc(x - w/2 + 14, y + h/2 - 14, 6, 0, Math.PI * 2);
-    ctx.arc(x + w/2 - 14, y + h/2 - 14, 6, 0, Math.PI * 2);
+    ctx.arc(hLeftX,  hY, 6, 0, Math.PI * 2);
+    ctx.arc(hRightX, hY, 6, 0, Math.PI * 2);
     ctx.fill();
 
-    // Gözler (sevimli yüz)
     ctx.fillStyle = PALETTE.carEye;
     ctx.beginPath();
     ctx.arc(x - 11, y - h/2 + 33, 6, 0, Math.PI * 2);
     ctx.arc(x + 11, y - h/2 + 33, 6, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = PALETTE.carPupil;
-    const blink = Math.sin(state.timeMs * 0.003) > 0.97 ? 0.2 : 1; // ara sıra göz kırp
+    const blink = Math.sin(state.timeMs * 0.003) > 0.97 ? 0.2 : 1;
     ctx.beginPath();
     ctx.arc(x - 10, y - h/2 + 33, 3 * blink, 0, Math.PI * 2);
     ctx.arc(x + 12, y - h/2 + 33, 3 * blink, 0, Math.PI * 2);
@@ -436,7 +688,8 @@
 
   function drawParticles() {
     for (const p of state.particles) {
-      ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+      const alpha = Math.max(0, Math.min(1, p.life));
+      ctx.globalAlpha = p.puff ? alpha * 0.6 : alpha;
       ctx.fillStyle = p.color;
       if (p.star) {
         drawStar(p.x, p.y, p.size + 2, p.size * 0.45);
@@ -468,17 +721,13 @@
     const x = (W - barW) / 2 + 22;
     const y = margin;
 
-    // Arka panel
     ctx.fillStyle = 'rgba(0,0,0,0.4)';
     roundRect(x - 8, y - 8, barW + 16, barH + 16, 20);
     ctx.fill();
-
-    // Boş bar
     ctx.fillStyle = PALETTE.energyEmpty;
     roundRect(x, y, barW, barH, 15);
     ctx.fill();
 
-    // Dolu bar
     const fillW = barW * state.energy;
     if (fillW > 4) {
       const g = ctx.createLinearGradient(x, 0, x + barW, 0);
@@ -488,14 +737,11 @@
       ctx.fillStyle = g;
       roundRect(x, y, fillW, barH, 15);
       ctx.fill();
-
-      // İç parlama çizgisi
       ctx.fillStyle = 'rgba(255,255,255,0.4)';
       roundRect(x + 4, y + 4, fillW - 8, 6, 4);
       ctx.fill();
     }
 
-    // Pulse
     if (state.energyPulse > 0) {
       ctx.globalAlpha = state.energyPulse * 0.55;
       ctx.fillStyle = '#FFFFFF';
@@ -504,7 +750,6 @@
       ctx.globalAlpha = 1;
     }
 
-    // Damla ikonu (sol başta)
     const iconX = x - 22;
     const iconY = y + barH / 2;
     ctx.fillStyle = PALETTE.droplet;
@@ -520,7 +765,6 @@
   }
 
   function drawIdleHint() {
-    // Araba etrafında nabız atan halka — "bana dokun"
     const x = state.carX;
     const y = H - CONFIG.CAR_BOTTOM_OFFSET;
     const pulse = (Math.sin(state.timeMs * 0.005) + 1) * 0.5;
