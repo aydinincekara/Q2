@@ -1,1 +1,569 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Elif Yarışı</title>
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #1a1033;
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  'use strict';
 
+  // ============================================================
+  //  AYAR SABİTLERİ  (revizyon için en üstte topladım)
+  // ============================================================
+  const CONFIG = {
+    LANE_COUNT: 3,
+    CAR_LERP: 0.18,            // şerit geçiş yumuşaklığı (0-1)
+    SPHERE_SPEED: 240,         // küre düşme hızı (px/s)
+    SPHERE_SPAWN_MS: 1500,     // küreler arası süre (ms)
+    SCROLL_SPEED: 340,         // yol akış hızı (px/s)
+    ENERGY_PER_PICKUP: 0.12,   // her toplamada bar kaç birim dolar
+    CAR_BOTTOM_OFFSET: 120,    // arabanın alttan yüksekliği (px)
+    PICKUP_TOLERANCE_Y: 55,    // çarpışma için dikey tolerans (px)
+  };
+
+  const PALETTE = {
+    sky1: '#5BC5FF',
+    sky2: '#9F7BFF',
+    hills: 'rgba(255,255,255,0.18)',
+    road: '#2E2740',
+    roadEdge: '#FFFFFF',
+    roadShoulder: '#22C55E',
+    laneLine: '#FFE45E',
+    carBody: '#FF4F6D',
+    carRoof: '#C12C4A',
+    carWindow: '#9FE1FF',
+    carWheel: '#1A1A1A',
+    carEye: '#FFFFFF',
+    carPupil: '#1A1A1A',
+    carHeadlight: '#FFE45E',
+    sphere: '#FFF7D6',
+    sphereGlow: '#FFD84D',
+    sphereText: '#3B2F0A',
+    energyEmpty: '#2B1F4D',
+    energyFill1: '#FFC65C',
+    energyFill2: '#FF6FA4',
+    energyFill3: '#7BE5C2',
+    droplet: '#FF6FA4',
+  };
+
+  // ============================================================
+  //  CANVAS KURULUMU  (DPI farkındalıklı)
+  // ============================================================
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ============================================================
+  //  YARDIMCI FONKSİYONLAR
+  // ============================================================
+  function roadBounds() {
+    const w = Math.min(W * 0.78, 520);
+    return { left: (W - w) / 2, width: w };
+  }
+  function laneX(i) {
+    const { left, width } = roadBounds();
+    const lw = width / CONFIG.LANE_COUNT;
+    return left + lw * (i + 0.5);
+  }
+  function roundRect(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.arcTo (x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.arcTo (x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h);
+    ctx.arcTo (x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r);
+    ctx.arcTo (x, y, x + r, y, r);
+    ctx.closePath();
+  }
+
+  // ============================================================
+  //  OYUN DURUMU
+  // ============================================================
+  const state = {
+    started: false,
+    carLane: 1,
+    carTargetLane: 1,
+    carX: 0,
+    carBob: 0,
+    spheres: [],
+    particles: [],
+    energy: 0,
+    energyPulse: 0,
+    roadOffset: 0,
+    lastSpawn: 0,
+    timeMs: 0,
+    celebrate: 0,
+  };
+  state.carX = laneX(state.carLane);
+
+  // ============================================================
+  //  GİRDİ  (her tıklama/dokunma → en yakın şerit)
+  // ============================================================
+  function handleInput(clientX) {
+    const { left, width } = roadBounds();
+    let lane = Math.floor(((clientX - left) / width) * CONFIG.LANE_COUNT);
+    lane = Math.max(0, Math.min(CONFIG.LANE_COUNT - 1, lane));
+    state.carTargetLane = lane;
+    if (!state.started) {
+      state.started = true;
+      state.lastSpawn = state.timeMs - CONFIG.SPHERE_SPAWN_MS + 300; // hızlı ilk küre
+    }
+  }
+  canvas.addEventListener('mousedown', (e) => handleInput(e.clientX));
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (e.touches.length > 0) handleInput(e.touches[0].clientX);
+  }, { passive: false });
+
+  // ============================================================
+  //  SPAWN & PARÇACIK
+  // ============================================================
+  function spawnSphere() {
+    const lane = Math.floor(Math.random() * CONFIG.LANE_COUNT);
+    state.spheres.push({
+      lane,
+      x: laneX(lane),
+      y: -60,
+      radius: 44,
+      wobble: Math.random() * Math.PI * 2,
+      alive: true,
+    });
+  }
+  function spawnParticles(x, y) {
+    const colors = ['#FFD84D', '#FF6FA4', '#7BE5C2', '#FFFFFF', '#FFC65C', '#A78BFA'];
+    for (let i = 0; i < 22; i++) {
+      const angle = (Math.PI * 2 * i) / 22 + (Math.random() - 0.5) * 0.4;
+      const speed = 200 + Math.random() * 260;
+      state.particles.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        size: 4 + Math.random() * 4,
+        color: colors[(Math.random() * colors.length) | 0],
+        star: false,
+      });
+    }
+    for (let i = 0; i < 8; i++) {
+      state.particles.push({
+        x, y,
+        vx: (Math.random() - 0.5) * 140,
+        vy: -180 - Math.random() * 220,
+        life: 1.2,
+        size: 7,
+        color: '#FFFFFF',
+        star: true,
+      });
+    }
+  }
+
+  // ============================================================
+  //  GÜNCELLEME
+  // ============================================================
+  function update(dt) {
+    state.timeMs += dt * 1000;
+    state.carBob += dt * 4;
+
+    // Araba yumuşak şerit geçişi
+    const targetX = laneX(state.carTargetLane);
+    state.carX += (targetX - state.carX) * CONFIG.CAR_LERP;
+    state.carLane = state.carTargetLane;
+
+    // Yolun sürekli akması (oyun başlamamış olsa bile küçük animasyon)
+    const scroll = state.started ? CONFIG.SCROLL_SPEED : CONFIG.SCROLL_SPEED * 0.25;
+    state.roadOffset = (state.roadOffset + scroll * dt) % 80;
+
+    if (!state.started) return;
+
+    // Küre üretimi
+    if (state.timeMs - state.lastSpawn > CONFIG.SPHERE_SPAWN_MS) {
+      spawnSphere();
+      state.lastSpawn = state.timeMs;
+    }
+
+    // Küreleri güncelle + çarpışma
+    const carY = H - CONFIG.CAR_BOTTOM_OFFSET;
+    for (const s of state.spheres) {
+      s.y += CONFIG.SPHERE_SPEED * dt;
+      s.wobble += dt * 3;
+      // şerit konumu da hafif lerp ile takip etsin (kürelerin doğal akışı)
+      s.x = laneX(s.lane);
+      if (s.alive && s.lane === state.carLane) {
+        if (Math.abs(s.y - carY) < CONFIG.PICKUP_TOLERANCE_Y) {
+          s.alive = false;
+          onPickup(s);
+        }
+      }
+    }
+    state.spheres = state.spheres.filter(s => s.alive && s.y < H + 80);
+
+    // Parçacıklar
+    for (const p of state.particles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 620 * dt;
+      p.life -= dt * 1.3;
+    }
+    state.particles = state.particles.filter(p => p.life > 0);
+
+    if (state.energyPulse > 0) state.energyPulse = Math.max(0, state.energyPulse - dt * 3);
+    if (state.celebrate   > 0) state.celebrate   = Math.max(0, state.celebrate   - dt * 0.9);
+  }
+
+  function onPickup(s) {
+    spawnParticles(s.x, s.y);
+    state.energyPulse = 1;
+    console.log("Ses çalındı: Aaaa ve Tin! efekti");
+
+    state.energy += CONFIG.ENERGY_PER_PICKUP;
+    if (state.energy >= 1) {
+      state.energy = 1;
+      state.celebrate = 1;
+      // küçük kutlama, sonra barı sıfırla
+      setTimeout(() => { state.energy = 0; }, 1300);
+      console.log("Kontrol noktası! Bar doldu, yeni boya açıldı (placeholder).");
+    }
+  }
+
+  // ============================================================
+  //  ÇİZİM
+  // ============================================================
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, PALETTE.sky1);
+    g.addColorStop(1, PALETTE.sky2);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Uzaktaki tepeler
+    ctx.fillStyle = PALETTE.hills;
+    ctx.beginPath();
+    const hillY = H * 0.42;
+    ctx.moveTo(0, hillY);
+    for (let x = 0; x <= W; x += 30) {
+      ctx.lineTo(x, hillY + Math.sin(x * 0.018 + 1) * 22 + Math.cos(x * 0.04) * 8);
+    }
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    // Bulutlar (yavaşça hareket)
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    const cloudT = state.timeMs * 0.01;
+    [[0.15, 0.18, 1.0], [0.55, 0.10, 0.8], [0.82, 0.22, 1.1]].forEach(([fx, fy, scale]) => {
+      const cx = ((fx * W + cloudT) % (W + 200)) - 100;
+      const cy = fy * H;
+      ctx.beginPath();
+      ctx.arc(cx,        cy,        22 * scale, 0, Math.PI * 2);
+      ctx.arc(cx + 22*scale, cy - 8*scale, 26 * scale, 0, Math.PI * 2);
+      ctx.arc(cx + 45*scale, cy,        20 * scale, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  function drawRoad() {
+    const { left, width } = roadBounds();
+
+    // Çim/kenar
+    ctx.fillStyle = PALETTE.roadShoulder;
+    ctx.fillRect(left - 26, 0, width + 52, H);
+
+    // Yol
+    ctx.fillStyle = PALETTE.road;
+    ctx.fillRect(left, 0, width, H);
+
+    // Beyaz yol kenarları
+    ctx.fillStyle = PALETTE.roadEdge;
+    ctx.fillRect(left - 4, 0, 4, H);
+    ctx.fillRect(left + width, 0, 4, H);
+
+    // Şerit çizgileri (akan kesik çizgiler)
+    const laneWidth = width / CONFIG.LANE_COUNT;
+    ctx.fillStyle = PALETTE.laneLine;
+    for (let i = 1; i < CONFIG.LANE_COUNT; i++) {
+      const x = left + laneWidth * i - 3;
+      for (let y = -80 + state.roadOffset; y < H; y += 80) {
+        ctx.fillRect(x, y, 6, 44);
+      }
+    }
+  }
+
+  function drawSphere(s) {
+    const wob = Math.sin(s.wobble) * 5;
+    const x = s.x + wob;
+    const y = s.y;
+
+    // Glow halkaları
+    for (let i = 3; i >= 1; i--) {
+      ctx.globalAlpha = 0.16 * (4 - i) / 3;
+      ctx.fillStyle = PALETTE.sphereGlow;
+      ctx.beginPath();
+      ctx.arc(x, y, s.radius + i * 8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Ana küre
+    ctx.fillStyle = PALETTE.sphere;
+    ctx.beginPath();
+    ctx.arc(x, y, s.radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Parlama
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath();
+    ctx.arc(x - s.radius * 0.38, y - s.radius * 0.38, s.radius * 0.26, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Elif harfi
+    ctx.fillStyle = PALETTE.sphereText;
+    ctx.font = `bold ${Math.floor(s.radius * 1.55)}px "Tahoma", "Arial", sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('ا', x, y + 4);
+  }
+
+  function drawCar() {
+    const x = state.carX;
+    const y = H - CONFIG.CAR_BOTTOM_OFFSET + Math.sin(state.carBob) * 2;
+    const w = 78, h = 108;
+
+    // Gölge
+    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    ctx.beginPath();
+    ctx.ellipse(x, y + h / 2 + 10, w / 2 + 4, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Tekerlekler
+    ctx.fillStyle = PALETTE.carWheel;
+    const wheelPositions = [
+      [-w/2 - 4, -h/2 + 22],
+      [ w/2 - 12, -h/2 + 22],
+      [-w/2 - 4,  h/2 - 32],
+      [ w/2 - 12, h/2 - 32],
+    ];
+    wheelPositions.forEach(([dx, dy]) => {
+      roundRect(x + dx, y + dy, 16, 24, 5);
+      ctx.fill();
+    });
+
+    // Gövde
+    ctx.fillStyle = PALETTE.carBody;
+    roundRect(x - w/2, y - h/2, w, h, 16);
+    ctx.fill();
+
+    // Tavan
+    ctx.fillStyle = PALETTE.carRoof;
+    roundRect(x - w/2 + 9, y - h/2 + 16, w - 18, 38, 11);
+    ctx.fill();
+
+    // Pencere
+    ctx.fillStyle = PALETTE.carWindow;
+    roundRect(x - w/2 + 15, y - h/2 + 22, w - 30, 24, 7);
+    ctx.fill();
+
+    // Pencere yansıması
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    roundRect(x - w/2 + 17, y - h/2 + 24, 14, 8, 4);
+    ctx.fill();
+
+    // Farlar
+    ctx.fillStyle = PALETTE.carHeadlight;
+    ctx.beginPath();
+    ctx.arc(x - w/2 + 14, y + h/2 - 14, 6, 0, Math.PI * 2);
+    ctx.arc(x + w/2 - 14, y + h/2 - 14, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Gözler (sevimli yüz)
+    ctx.fillStyle = PALETTE.carEye;
+    ctx.beginPath();
+    ctx.arc(x - 11, y - h/2 + 33, 6, 0, Math.PI * 2);
+    ctx.arc(x + 11, y - h/2 + 33, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.carPupil;
+    const blink = Math.sin(state.timeMs * 0.003) > 0.97 ? 0.2 : 1; // ara sıra göz kırp
+    ctx.beginPath();
+    ctx.arc(x - 10, y - h/2 + 33, 3 * blink, 0, Math.PI * 2);
+    ctx.arc(x + 12, y - h/2 + 33, 3 * blink, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawParticles() {
+    for (const p of state.particles) {
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+      ctx.fillStyle = p.color;
+      if (p.star) {
+        drawStar(p.x, p.y, p.size + 2, p.size * 0.45);
+      } else {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * Math.max(0.2, p.life), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawStar(cx, cy, outer, inner) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const r = i % 2 === 0 ? outer : inner;
+      const a = (Math.PI * 2 * i) / 10 - Math.PI / 2;
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawEnergyBar() {
+    const margin = 20;
+    const barH = 30;
+    const barW = Math.min(W - margin * 2 - 50, 420);
+    const x = (W - barW) / 2 + 22;
+    const y = margin;
+
+    // Arka panel
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    roundRect(x - 8, y - 8, barW + 16, barH + 16, 20);
+    ctx.fill();
+
+    // Boş bar
+    ctx.fillStyle = PALETTE.energyEmpty;
+    roundRect(x, y, barW, barH, 15);
+    ctx.fill();
+
+    // Dolu bar
+    const fillW = barW * state.energy;
+    if (fillW > 4) {
+      const g = ctx.createLinearGradient(x, 0, x + barW, 0);
+      g.addColorStop(0,   PALETTE.energyFill1);
+      g.addColorStop(0.5, PALETTE.energyFill2);
+      g.addColorStop(1,   PALETTE.energyFill3);
+      ctx.fillStyle = g;
+      roundRect(x, y, fillW, barH, 15);
+      ctx.fill();
+
+      // İç parlama çizgisi
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      roundRect(x + 4, y + 4, fillW - 8, 6, 4);
+      ctx.fill();
+    }
+
+    // Pulse
+    if (state.energyPulse > 0) {
+      ctx.globalAlpha = state.energyPulse * 0.55;
+      ctx.fillStyle = '#FFFFFF';
+      roundRect(x, y, fillW, barH, 15);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Damla ikonu (sol başta)
+    const iconX = x - 22;
+    const iconY = y + barH / 2;
+    ctx.fillStyle = PALETTE.droplet;
+    ctx.beginPath();
+    ctx.moveTo(iconX, iconY - 18);
+    ctx.bezierCurveTo(iconX + 16, iconY - 4, iconX + 16, iconY + 12, iconX, iconY + 16);
+    ctx.bezierCurveTo(iconX - 16, iconY + 12, iconX - 16, iconY - 4, iconX, iconY - 18);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.arc(iconX - 4, iconY + 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawIdleHint() {
+    // Araba etrafında nabız atan halka — "bana dokun"
+    const x = state.carX;
+    const y = H - CONFIG.CAR_BOTTOM_OFFSET;
+    const pulse = (Math.sin(state.timeMs * 0.005) + 1) * 0.5;
+    ctx.globalAlpha = 0.4 + pulse * 0.45;
+    ctx.strokeStyle = '#FFE45E';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(x, y, 78 + pulse * 16, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCelebration() {
+    if (state.celebrate <= 0) return;
+    ctx.globalAlpha = state.celebrate * 0.35;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  // ============================================================
+  //  ANA DÖNGÜ
+  // ============================================================
+  let lastTime = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - lastTime) / 1000);
+    lastTime = now;
+
+    update(dt);
+
+    drawBackground();
+    drawRoad();
+    for (const s of state.spheres) drawSphere(s);
+    drawCar();
+    drawParticles();
+    drawCelebration();
+    drawEnergyBar();
+    if (!state.started) drawIdleHint();
+
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
